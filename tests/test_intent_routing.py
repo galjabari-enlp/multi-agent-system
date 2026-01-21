@@ -2,7 +2,7 @@ import re
 from unittest.mock import patch
 
 from backend.manager import detect_intent, run_manager_workflow
-from backend.schemas import SimpleFactResult
+from backend.schemas import QuickAnswerResult
 
 
 # We'll patch agent builders so no real LLM/API keys are needed.
@@ -11,15 +11,21 @@ class DummyLLM:
         raise RuntimeError("DummyLLM.call should not be invoked in this test")
 
 
-def test_detect_intent_simple_fact():
-    assert detect_intent("Who is the CEO of Tesla?") == "simple_fact"
+def test_detect_intent_quick_answer():
+    assert detect_intent("Who is the CEO of Tesla?") == "quick_answer"
 
 
 def test_detect_intent_full_report():
     assert detect_intent("Research Nvidia ticker NVDA") == "full_report"
 
 
-def test_simple_fact_routes_to_news_only_and_returns_one_sentence():
+def test_quick_answer_other_question_types_route_correctly():
+    assert detect_intent("What does Nvidia make?") == "quick_answer"
+    assert detect_intent("What is Elon Musk's net worth?") == "quick_answer"
+    assert detect_intent("What is Serper?") == "quick_answer"
+
+
+def test_quick_answer_routes_to_news_only_and_returns_one_sentence():
     # Patch Crew and builders so we don't instantiate CrewAI Task/Agent/LLM.
 
     class DummyOutput:
@@ -30,17 +36,18 @@ def test_simple_fact_routes_to_news_only_and_returns_one_sentence():
     class DummyTask:
         def __init__(self):
             self.output = DummyOutput(
-                SimpleFactResult(
+                QuickAnswerResult(
                     answer="The CEO of Tesla is Elon Musk.",
                     source_url="https://www.tesla.com/leadership",
                     confidence="high",
+                    query_used="Tesla CEO",
                 )
             )
 
     dummy_task = DummyTask()
 
     def fake_build_news_task(*args, **kwargs):
-        assert kwargs.get("mode") == "simple_fact"
+        assert kwargs.get("mode") == "quick_answer"
         return dummy_task
 
     class DummyCrew:

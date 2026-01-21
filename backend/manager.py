@@ -12,7 +12,7 @@ from crewai import Agent, Crew, Process, Task
 from backend.financial_analyst import build_financial_analyst_agent, build_financial_task
 from backend.news_researcher import build_news_researcher_agent, build_news_task
 from backend.report_writer import build_report_task, build_report_writer_agent
-from backend.schemas import ManagerParsedPrompt, ManagerState, NewsResearchResult, SimpleFactResult
+from backend.schemas import ManagerParsedPrompt, ManagerState, NewsResearchResult, QuickAnswerResult
 
 logger = logging.getLogger(__name__)
 
@@ -164,18 +164,76 @@ def _needs_second_search(nr: NewsResearchResult) -> bool:
     return missing >= 3
 
 
-IntentType = Literal["simple_fact", "full_report"]
+IntentType = Literal["quick_answer", "full_report"]
+
+DomainType = Literal["in_domain", "out_of_domain"]
+
+_DOMAIN_KEYWORDS = [
+    "company",
+    "competitor",
+    "ceo",
+    "founder",
+    "ticker",
+    "stock",
+    "earnings",
+    "revenue",
+    "funding",
+    "valuation",
+    "market cap",
+    "pricing",
+    "product",
+    "partnership",
+    "acquisition",
+    "headquarters",
+    "employees",
+    "net worth",
+    "investor",
+    "financial",
+    "swot",
+]
 
 
-_SIMPLE_FACT_PATTERNS = [
+def detect_domain(user_message: str) -> tuple[DomainType, list[str]]:
+    """Return (domain, matched_keywords).
+
+    Heuristic-only domain gate to prevent non-business use. We intentionally
+    avoid LLM calls or tools here.
+    """
+
+    msg = (user_message or "").strip().lower()
+    matched: list[str] = []
+    for kw in _DOMAIN_KEYWORDS:
+        if kw in msg:
+            matched.append(kw)
+
+    if matched:
+        return "in_domain", matched
+
+    # Extra heuristic: proper-noun-like token sequences + business context words.
+    # Example: "Tell me about Tesla" (no explicit keywords) should still be in-domain
+    # if it also contains a business-context signal.
+    business_context = ["company", "business", "startup", "firm", "inc", "ltd", "llc", "plc", "corp"]
+    has_business_context = any(t in msg for t in business_context)
+    has_entity_like = bool(re.search(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\b", user_message or ""))
+    if has_business_context and has_entity_like:
+        return "in_domain", ["entity+business_context"]
+
+    return "out_of_domain", []
+
+
+_QUICK_ANSWER_PATTERNS = [
     # Accept optional trailing '?' so "Who is the CEO of Tesla" routes correctly.
-    r"^\s*who\s+is\s+the\s+ceo\s+of\s+.+\??\s*$",
     r"^\s*who\s+is\s+.+\??\s*$",
+    r"^\s*who\s+are\s+.+\??\s*$",
+    r"^\s*who\s+founded\s+.+\??\s*$",
+    r"^\s*who\s+owns\s+.+\??\s*$",
+    r"^\s*what\s+is\s+.+\??\s*$",
+    r"^\s*what\s+does\s+.+\s+do\??\s*$",
+    r"^\s*what\s+does\s+.+\s+make\??\s*$",
     r"^\s*where\s+is\s+.+\s+(headquartered|based)\??\s*$",
     r"^\s*when\s+was\s+.+\s+founded\??\s*$",
-    r"^\s*what\s+is\s+.+\s+ticker\??\s*$",
     r"^\s*how\s+many\s+employees\s+does\s+.+\s+have\??\s*$",
-    r"^\s*what\s+does\s+.+\s+do\??\s*$",
+    r"^\s*how\s+much\s+is\s+.+\s+worth\??\s*$",
 ]
 
 _FULL_REPORT_KEYWORDS = [
@@ -194,21 +252,35 @@ _FULL_REPORT_KEYWORDS = [
 
 def detect_intent(user_message: str) -> IntentType:
     msg = (user_message or "").strip().lower()
+
     for kw in _FULL_REPORT_KEYWORDS:
         if kw in msg:
+            logger.info("Intent heuristic: full_report matched keyword=%r", kw)
             return "full_report"
 
-    # If it mentions ticker with a verb like research/analyze handled above.
-    for pat in _SIMPLE_FACT_PATTERNS:
+    for pat in _QUICK_ANSWER_PATTERNS:
         if re.match(pat, msg, flags=re.IGNORECASE):
-            return "simple_fact"
+            logger.info("Intent heuristic: quick_answer matched pattern=%r", pat)
+            return "quick_answer"
 
-    # Heuristic: short length + contains facty terms (punctuation optional).
-    fact_terms = ["ceo", "founder", "headquartered", "headquarters", "ticker", "employees", "founded"]
-    if len(msg) <= 120 and any(t in msg for t in fact_terms):
-        # Avoid routing imperative prompts without a question mark unless they clearly look like a question.
-        if "?" in msg or msg.startswith(("who ", "where ", "when ", "what ", "how many ")):
-            return "simple_fact"
+    # Heuristic: short length + contains lookup terms.
+    lookup_terms = [
+        "ceo",
+        "founder",
+        "founded",
+        "headquartered",
+        "headquarters",
+        "hq",
+        "ticker",
+        "employees",
+        "net worth",
+        "market cap",
+        "revenue",
+    ]
+    if len(msg) <= 140 and any(t in msg for t in lookup_terms):
+        if "?" in msg or msg.startswith(("who ", "where ", "when ", "what ", "how many ", "how much ")):
+            logger.info("Intent heuristic: quick_answer matched lookup_terms")
+            return "quick_answer"
 
     return "full_report"
 
@@ -253,11 +325,19 @@ def _focused_query_for_simple_fact(question: str, entity: str) -> str:
     return f"{entity} {question}".strip()
 
 
-def _run_simple_fact(*, user_message: str, llm) -> str:
+def _run_quick_answer(*, user_message: str, llm) -> str:
     entity = _extract_entity_from_question(user_message)
     focused_query = _focused_query_for_simple_fact(user_message, entity)
+    # Finance-ish single metrics should bias toward authoritative sources.
+    lm = user_message.lower()
+    if "net worth" in lm:
+        focused_query = f"{entity} net worth Forbes" if entity else "net worth Forbes"
+    elif "market cap" in lm:
+        focused_query = f"{entity} market cap" if entity else "market cap"
+    elif "revenue" in lm:
+        focused_query = f"{entity} revenue" if entity else "revenue"
     logger.info(
-        "Intent routing: simple_fact entity=%r focused_query=%r",
+        "Intent routing: quick_answer entity=%r focused_query=%r",
         entity,
         focused_query,
     )
@@ -267,7 +347,7 @@ def _run_simple_fact(*, user_message: str, llm) -> str:
         news_agent,
         competitor_name=entity or "unknown",
         keywords=[],
-        mode="simple_fact",
+        mode="quick_answer",
         question=user_message,
         focused_query=focused_query,
     )
@@ -280,47 +360,58 @@ def _run_simple_fact(*, user_message: str, llm) -> str:
     )
     _ = crew.kickoff()
 
-    sf = news_task.output.pydantic  # type: ignore[assignment]
-    if sf is None:
+    qa = news_task.output.pydantic  # type: ignore[assignment]
+    if qa is None:
         logger.error(
-            "SimpleFact task produced no parsed output. raw=%r",
+            "QuickAnswer task produced no parsed output. raw=%r",
             getattr(news_task.output, "raw", None),
         )
         raw = getattr(news_task.output, "raw", None)
         if isinstance(raw, str):
-            sf = SimpleFactResult.model_validate_json(raw)
+            qa = QuickAnswerResult.model_validate_json(raw)
         else:
-            raise RuntimeError("SimpleFactResult parsing failed")
+            raise RuntimeError("QuickAnswerResult parsing failed")
 
     logger.info(
-        "Intent routing: simple_fact source_url=%r confidence=%r",
-        sf.source_url,
-        sf.confidence,
+        "Intent routing: quick_answer query_used=%r source_url=%r confidence=%r",
+        qa.query_used,
+        qa.source_url,
+        qa.confidence,
     )
 
-    # Return one sentence, optionally append citation if it still stays one sentence.
-    answer = sf.answer.strip()
+    answer = qa.answer.strip()
     answer = re.sub(r"\s+", " ", answer)
+    answer = re.sub(r"\n+", " ", answer)
     answer = re.sub(r"^[-*•]\s+", "", answer)
-    # Ensure single sentence by truncation.
     m = re.search(r"[\.!?]", answer)
     if m:
         answer = answer[: m.end()].strip()
     else:
         answer = answer.rstrip(".") + "."
 
-    # Append citation in parentheses if it doesn't create an extra sentence.
-    if sf.source_url and sf.source_url not in answer:
-        answer = answer.rstrip(".") + f" ({sf.source_url})."
+    if qa.source_url and qa.source_url not in answer:
+        answer = answer.rstrip(".") + f" ({qa.source_url})."
     return answer
 
 
 def run_manager_workflow(*, competitor_prompt: str, llm) -> ManagerResult:
+    domain, matched = detect_domain(competitor_prompt)
+    logger.info("Domain gate: domain=%s matched=%s", domain, matched)
+
+    if domain == "out_of_domain":
+        # Strict gate: do not call any agents/tools for out-of-domain messages.
+        fixed = "I can only help with company, business, and finance questions—please try another question."
+        state = ManagerState(
+            competitor_name="unknown",
+            parsed_prompt=ManagerParsedPrompt(competitor_name="unknown"),
+        )
+        return ManagerResult(state=state, memo_markdown=fixed)
+
     intent = detect_intent(competitor_prompt)
     logger.info("Detected intent=%s", intent)
 
-    if intent == "simple_fact":
-        direct = _run_simple_fact(user_message=competitor_prompt, llm=llm)
+    if intent == "quick_answer":
+        direct = _run_quick_answer(user_message=competitor_prompt, llm=llm)
         # Keep API contract consistent: return via memo_markdown.
         state = ManagerState(
             competitor_name=_extract_entity_from_question(competitor_prompt) or "unknown",

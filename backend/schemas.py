@@ -43,14 +43,15 @@ class NewsResearchResult(BaseModel):
     sources: List[Source] = Field(default_factory=list)
 
 
-class SimpleFactResult(BaseModel):
-    mode: Literal["simple_fact"] = "simple_fact"
-    answer: str = Field(..., description="One single-sentence answer")
+class QuickAnswerResult(BaseModel):
+    mode: Literal["quick_answer"] = "quick_answer"
+    answer: str = Field(..., description="Exactly one sentence")
     source_url: str = Field(..., description="Best URL backing the answer")
     confidence: Literal["high", "medium", "low"]
+    query_used: str = Field(..., description="Exact Serper query used")
 
 
-NewsResearchOutput = Union[NewsResearchResult, SimpleFactResult]
+NewsResearchOutput = Union[NewsResearchResult, QuickAnswerResult]
 
 
 class PricePerformance(BaseModel):

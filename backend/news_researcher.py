@@ -7,7 +7,7 @@ from typing import List, Optional
 
 from crewai import Agent, Task
 
-from backend.schemas import NewsResearchOutput, NewsResearchResult, SimpleFactResult, Source
+from backend.schemas import NewsResearchOutput, NewsResearchResult, QuickAnswerResult, Source
 from backend.tools.serper_search import serper_search
 
 logger = logging.getLogger(__name__)
@@ -95,9 +95,9 @@ def build_news_task(
     question: Optional[str] = None,
     focused_query: Optional[str] = None,
 ) -> Task:
-    if mode == "simple_fact":
+    if mode == "quick_answer":
         if not focused_query:
-            raise ValueError("focused_query is required for simple_fact mode")
+            raise ValueError("focused_query is required for quick_answer mode")
 
         sources = _serper_simple_fact_sources(focused_query)
         sources_payload = [s.model_dump() for s in sources]
@@ -105,22 +105,25 @@ def build_news_task(
         prompt = f"""
 You are the NewsResearcher.
 
-Task: Answer a simple factual question quickly.
+Task: Answer a short factual question quickly.
 
 You MUST use ONLY the SOURCES list below (Serper search results). Do NOT fabricate.
 
 Return ONLY valid JSON that matches this schema:
-{SimpleFactResult.model_json_schema()}
+{QuickAnswerResult.model_json_schema()}
 
 Rules:
-- mode must be "simple_fact".
-- answer must be exactly ONE sentence (no bullet lists).
+- mode must be "quick_answer".
+- answer must be exactly ONE sentence (no bullet lists, no newlines).
+- query_used must be exactly the provided Focused query.
 - Pick ONE best source_url from the sources.
+- Prefer authoritative sources when possible (official company pages, investor relations, reputable finance sources).
+- If results conflict or change frequently (e.g., net worth / market cap), include a time qualifier in the same single sentence if supported by sources.
 - If you cannot confirm from reliable sources, answer with ONE sentence indicating uncertainty and still provide the best available source_url.
 - Use ONLY double quotes in JSON.
 
 Question: {question or focused_query}
-Company/entity: {competitor_name}
+Entity: {competitor_name}
 Focused query: {focused_query}
 
 SOURCES:
@@ -129,9 +132,9 @@ SOURCES:
 
         return Task(
             description=prompt,
-            expected_output="JSON matching SimpleFactResult schema",
+            expected_output="JSON matching QuickAnswerResult schema",
             agent=agent,
-            output_json=SimpleFactResult,
+            output_json=QuickAnswerResult,
         )
 
     # Default: report_research

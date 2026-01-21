@@ -14,30 +14,34 @@ Agents:
 - FinancialAnalyst (Alpha Vantage)
 - ReportWriter (memo)
 
-## Intent-aware routing (simple facts vs full reports)
+## Intent-aware routing (quick answers vs full reports)
 
 The Manager now routes requests based on detected intent:
 
-- **`simple_fact`**: single factual lookup questions (CEO, HQ, founded year, ticker, employee count, “what does X do”).
-  - Manager calls only [`backend/news_researcher.py:build_news_task()`](backend/news_researcher.py:53) with `mode="simple_fact"`.
-  - NewsResearcher uses Serper and returns a one-sentence answer plus a best `source_url`.
+- **`quick_answer`**: short factual lookup questions or 1–2 sentence definitions (CEO/founder/ownership, HQ, founded year, ticker, employees, net worth, market cap, revenue, “what does X do/make”, “what is X”).
+  - Manager calls only [`backend/news_researcher.py:build_news_task()`](backend/news_researcher.py:96) with `mode="quick_answer"`.
+  - NewsResearcher uses Serper and returns a one-sentence `answer` plus `source_url` and `confidence`.
   - Manager returns that sentence directly (skips FinancialAnalyst + ReportWriter).
 
 - **`full_report`**: competitor research / reports / analysis requests.
   - Existing pipeline remains unchanged: NewsResearcher → FinancialAnalyst → ReportWriter.
 
-Examples that route to **simple_fact**:
+Examples that route to **quick_answer**:
 - “Who is the CEO of Tesla?”
-- “Where is OpenAI headquartered?”
-- “When was Nvidia founded?”
+- “Who founded Stripe?”
+- “What does Nvidia make?”
+- “Where is Shopify headquartered?”
+- “When was SpaceX founded?”
+- “How many employees does Airbnb have?”
 - “What is Apple’s ticker?”
-- “How many employees does Shopify have?”
+- “What is Elon Musk’s net worth?”
+- “What is Alpha Vantage?”
 
 Examples that route to **full_report**:
 - “Research Nvidia ticker NVDA”
 - “Write a market report on Stripe”
 - “Analyze Notion’s products and pricing and recent developments”
-- “Competitor analysis: Figma”
+- “Competitor analysis: Figma"
 
 ### Tests
 
