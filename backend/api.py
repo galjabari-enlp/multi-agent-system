@@ -76,6 +76,7 @@ def create_app() -> FastAPI:
         llm = _build_llm()
         result = run_manager_workflow(competitor_prompt=req.message, llm=llm)
 
+        # For both simple_fact and full_report, we return a `reply` string.
         return ChatResponse(reply=result.memo_markdown, chat_id=chat_id)
 
     return app

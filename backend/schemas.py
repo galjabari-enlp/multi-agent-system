@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field
 
@@ -36,10 +36,21 @@ class ProductsPricing(BaseModel):
 
 
 class NewsResearchResult(BaseModel):
+    mode: Literal["report_research"] = "report_research"
     company_overview: CompanyOverview
     recent_developments: RecentDevelopments
     products_pricing: ProductsPricing
     sources: List[Source] = Field(default_factory=list)
+
+
+class SimpleFactResult(BaseModel):
+    mode: Literal["simple_fact"] = "simple_fact"
+    answer: str = Field(..., description="One single-sentence answer")
+    source_url: str = Field(..., description="Best URL backing the answer")
+    confidence: Literal["high", "medium", "low"]
+
+
+NewsResearchOutput = Union[NewsResearchResult, SimpleFactResult]
 
 
 class PricePerformance(BaseModel):

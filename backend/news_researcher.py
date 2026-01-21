@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
-from typing import List
+import logging
+import re
+from typing import List, Optional
 
 from crewai import Agent, Task
 
-from backend.schemas import NewsResearchResult, Source
+from backend.schemas import NewsResearchOutput, NewsResearchResult, SimpleFactResult, Source
 from backend.tools.serper_search import serper_search
+
+logger = logging.getLogger(__name__)
 
 
 def build_news_researcher_agent(llm) -> Agent:
@@ -23,7 +27,7 @@ def build_news_researcher_agent(llm) -> Agent:
     )
 
 
-def _serper_tool(company_name: str, keywords: List[str]) -> List[Source]:
+def _serper_report_sources(company_name: str, keywords: List[str]) -> List[Source]:
     # Multiple focused queries yields better coverage; Manager can trigger a second pass if needed.
     # Include dedicated queries for HQ + leadership + headcount to reduce "unknown" fields.
     queries = [
@@ -50,13 +54,88 @@ def _serper_tool(company_name: str, keywords: List[str]) -> List[Source]:
     return sources
 
 
+def _serper_simple_fact_sources(query: str) -> List[Source]:
+    # Keep fast: single query, small result set.
+    sources = serper_search(query, num=6)
+    return sources
+
+
+def _normalize_one_sentence(text: str) -> str:
+    s = (text or "").strip()
+    s = re.sub(r"\s+", " ", s)
+    # Remove leading bullets if any
+    s = re.sub(r"^[-*•]\s+", "", s)
+    # Ensure exactly one sentence-ish: cut after first terminal punctuation.
+    m = re.search(r"[\.!?]", s)
+    if m:
+        s = s[: m.end()].strip()
+    else:
+        s = s.rstrip(".") + "."
+    return s
+
+
+def _estimate_confidence(answer: str, source_url: str) -> str:
+    a = (answer or "").lower()
+    if not answer or "couldn't confirm" in a or "cannot confirm" in a or "uncertain" in a:
+        return "low"
+    if source_url and any(
+        d in source_url.lower()
+        for d in ["wikipedia.org", "linkedin.com", "reddit.com", "quora.com"]
+    ):
+        return "medium"
+    return "high" if source_url else "low"
+
+
 def build_news_task(
     agent: Agent,
     *,
     competitor_name: str,
     keywords: List[str],
+    mode: str = "report_research",
+    question: Optional[str] = None,
+    focused_query: Optional[str] = None,
 ) -> Task:
-    sources = _serper_tool(competitor_name, keywords)
+    if mode == "simple_fact":
+        if not focused_query:
+            raise ValueError("focused_query is required for simple_fact mode")
+
+        sources = _serper_simple_fact_sources(focused_query)
+        sources_payload = [s.model_dump() for s in sources]
+
+        prompt = f"""
+You are the NewsResearcher.
+
+Task: Answer a simple factual question quickly.
+
+You MUST use ONLY the SOURCES list below (Serper search results). Do NOT fabricate.
+
+Return ONLY valid JSON that matches this schema:
+{SimpleFactResult.model_json_schema()}
+
+Rules:
+- mode must be "simple_fact".
+- answer must be exactly ONE sentence (no bullet lists).
+- Pick ONE best source_url from the sources.
+- If you cannot confirm from reliable sources, answer with ONE sentence indicating uncertainty and still provide the best available source_url.
+- Use ONLY double quotes in JSON.
+
+Question: {question or focused_query}
+Company/entity: {competitor_name}
+Focused query: {focused_query}
+
+SOURCES:
+{json.dumps(sources_payload, indent=2)}
+""".strip()
+
+        return Task(
+            description=prompt,
+            expected_output="JSON matching SimpleFactResult schema",
+            agent=agent,
+            output_json=SimpleFactResult,
+        )
+
+    # Default: report_research
+    sources = _serper_report_sources(competitor_name, keywords)
     sources_payload = [s.model_dump() for s in sources]
 
     prompt = f"""
@@ -69,6 +148,7 @@ Return ONLY valid JSON that matches this schema:
 
 Rules:
 - Return JSON ONLY (no markdown, no backticks, no trailing commentary).
+- mode must be "report_research".
 - Prefer last 6-12 months for Recent Developments.
 - For company overview fields (HQ, founded, employees, executives): prefer official pages (about, investor relations) and reputable sources.
 - If data is missing, put 'unknown' (string) or [] for lists.

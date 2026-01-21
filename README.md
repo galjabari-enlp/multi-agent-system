@@ -14,6 +14,41 @@ Agents:
 - FinancialAnalyst (Alpha Vantage)
 - ReportWriter (memo)
 
+## Intent-aware routing (simple facts vs full reports)
+
+The Manager now routes requests based on detected intent:
+
+- **`simple_fact`**: single factual lookup questions (CEO, HQ, founded year, ticker, employee count, “what does X do”).
+  - Manager calls only [`backend/news_researcher.py:build_news_task()`](backend/news_researcher.py:53) with `mode="simple_fact"`.
+  - NewsResearcher uses Serper and returns a one-sentence answer plus a best `source_url`.
+  - Manager returns that sentence directly (skips FinancialAnalyst + ReportWriter).
+
+- **`full_report`**: competitor research / reports / analysis requests.
+  - Existing pipeline remains unchanged: NewsResearcher → FinancialAnalyst → ReportWriter.
+
+Examples that route to **simple_fact**:
+- “Who is the CEO of Tesla?”
+- “Where is OpenAI headquartered?”
+- “When was Nvidia founded?”
+- “What is Apple’s ticker?”
+- “How many employees does Shopify have?”
+
+Examples that route to **full_report**:
+- “Research Nvidia ticker NVDA”
+- “Write a market report on Stripe”
+- “Analyze Notion’s products and pricing and recent developments”
+- “Competitor analysis: Figma”
+
+### Tests
+
+Run routing tests:
+
+```bash
+pytest -q
+```
+
+See [`tests/test_intent_routing.py`](tests/test_intent_routing.py) for minimal automated coverage.
+
 ## Project layout
 - [`backend/main.py`](backend/main.py:1) – CLI entrypoint
 - [`backend/manager.py`](backend/manager.py:1) – orchestrator workflow + internal state

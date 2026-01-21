@@ -5,14 +5,14 @@ import logging
 import os
 import re
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from crewai import Agent, Crew, Process, Task
 
 from backend.financial_analyst import build_financial_analyst_agent, build_financial_task
 from backend.news_researcher import build_news_researcher_agent, build_news_task
 from backend.report_writer import build_report_task, build_report_writer_agent
-from backend.schemas import ManagerParsedPrompt, ManagerState, NewsResearchResult
+from backend.schemas import ManagerParsedPrompt, ManagerState, NewsResearchResult, SimpleFactResult
 
 logger = logging.getLogger(__name__)
 
@@ -164,7 +164,170 @@ def _needs_second_search(nr: NewsResearchResult) -> bool:
     return missing >= 3
 
 
+IntentType = Literal["simple_fact", "full_report"]
+
+
+_SIMPLE_FACT_PATTERNS = [
+    # Accept optional trailing '?' so "Who is the CEO of Tesla" routes correctly.
+    r"^\s*who\s+is\s+the\s+ceo\s+of\s+.+\??\s*$",
+    r"^\s*who\s+is\s+.+\??\s*$",
+    r"^\s*where\s+is\s+.+\s+(headquartered|based)\??\s*$",
+    r"^\s*when\s+was\s+.+\s+founded\??\s*$",
+    r"^\s*what\s+is\s+.+\s+ticker\??\s*$",
+    r"^\s*how\s+many\s+employees\s+does\s+.+\s+have\??\s*$",
+    r"^\s*what\s+does\s+.+\s+do\??\s*$",
+]
+
+_FULL_REPORT_KEYWORDS = [
+    "research",
+    "competitor",
+    "analysis",
+    "analyze",
+    "market report",
+    "swot",
+    "pricing analysis",
+    "write a memo",
+    "memo",
+    "report",
+]
+
+
+def detect_intent(user_message: str) -> IntentType:
+    msg = (user_message or "").strip().lower()
+    for kw in _FULL_REPORT_KEYWORDS:
+        if kw in msg:
+            return "full_report"
+
+    # If it mentions ticker with a verb like research/analyze handled above.
+    for pat in _SIMPLE_FACT_PATTERNS:
+        if re.match(pat, msg, flags=re.IGNORECASE):
+            return "simple_fact"
+
+    # Heuristic: short length + contains facty terms (punctuation optional).
+    fact_terms = ["ceo", "founder", "headquartered", "headquarters", "ticker", "employees", "founded"]
+    if len(msg) <= 120 and any(t in msg for t in fact_terms):
+        # Avoid routing imperative prompts without a question mark unless they clearly look like a question.
+        if "?" in msg or msg.startswith(("who ", "where ", "when ", "what ", "how many ")):
+            return "simple_fact"
+
+    return "full_report"
+
+
+def _extract_entity_from_question(user_message: str) -> str:
+    # Very lightweight extraction for simple Qs.
+    msg = (user_message or "").strip()
+    patterns = [
+        r"ceo of\s+(?P<e>.+)\?",
+        r"where is\s+(?P<e>.+)\s+(headquartered|based)\?",
+        r"when was\s+(?P<e>.+)\s+founded\?",
+        r"what is\s+(?P<e>.+)\s+ticker\?",
+        r"how many employees does\s+(?P<e>.+)\s+have\?",
+        r"what does\s+(?P<e>.+)\s+do\?",
+    ]
+    for p in patterns:
+        m = re.search(p, msg, flags=re.IGNORECASE)
+        if m:
+            ent = m.group("e").strip()
+            ent = re.sub(r"[\?\.]+$", "", ent).strip()
+            return ent
+
+    # fallback: remove leading question words
+    ent = re.sub(r"^(who|where|when|what|how many)\b", "", msg, flags=re.IGNORECASE).strip()
+    return re.sub(r"[\?\.]+$", "", ent).strip()[:80]
+
+
+def _focused_query_for_simple_fact(question: str, entity: str) -> str:
+    q = question.lower()
+    if "ceo" in q:
+        return f"{entity} CEO"
+    if "headquartered" in q or "headquarters" in q or "based" in q:
+        return f"{entity} headquarters"
+    if "founded" in q:
+        return f"{entity} founded year"
+    if "ticker" in q:
+        return f"{entity} ticker symbol"
+    if "employees" in q or "headcount" in q:
+        return f"{entity} number of employees"
+    if "what does" in q and "do" in q:
+        return f"what does {entity} do"
+    return f"{entity} {question}".strip()
+
+
+def _run_simple_fact(*, user_message: str, llm) -> str:
+    entity = _extract_entity_from_question(user_message)
+    focused_query = _focused_query_for_simple_fact(user_message, entity)
+    logger.info(
+        "Intent routing: simple_fact entity=%r focused_query=%r",
+        entity,
+        focused_query,
+    )
+
+    news_agent = build_news_researcher_agent(llm)
+    news_task = build_news_task(
+        news_agent,
+        competitor_name=entity or "unknown",
+        keywords=[],
+        mode="simple_fact",
+        question=user_message,
+        focused_query=focused_query,
+    )
+
+    crew = Crew(
+        agents=[news_agent],
+        tasks=[news_task],
+        process=Process.sequential,
+        verbose=bool(os.getenv("CREW_VERBOSE")),
+    )
+    _ = crew.kickoff()
+
+    sf = news_task.output.pydantic  # type: ignore[assignment]
+    if sf is None:
+        logger.error(
+            "SimpleFact task produced no parsed output. raw=%r",
+            getattr(news_task.output, "raw", None),
+        )
+        raw = getattr(news_task.output, "raw", None)
+        if isinstance(raw, str):
+            sf = SimpleFactResult.model_validate_json(raw)
+        else:
+            raise RuntimeError("SimpleFactResult parsing failed")
+
+    logger.info(
+        "Intent routing: simple_fact source_url=%r confidence=%r",
+        sf.source_url,
+        sf.confidence,
+    )
+
+    # Return one sentence, optionally append citation if it still stays one sentence.
+    answer = sf.answer.strip()
+    answer = re.sub(r"\s+", " ", answer)
+    answer = re.sub(r"^[-*•]\s+", "", answer)
+    # Ensure single sentence by truncation.
+    m = re.search(r"[\.!?]", answer)
+    if m:
+        answer = answer[: m.end()].strip()
+    else:
+        answer = answer.rstrip(".") + "."
+
+    # Append citation in parentheses if it doesn't create an extra sentence.
+    if sf.source_url and sf.source_url not in answer:
+        answer = answer.rstrip(".") + f" ({sf.source_url})."
+    return answer
+
+
 def run_manager_workflow(*, competitor_prompt: str, llm) -> ManagerResult:
+    intent = detect_intent(competitor_prompt)
+    logger.info("Detected intent=%s", intent)
+
+    if intent == "simple_fact":
+        direct = _run_simple_fact(user_message=competitor_prompt, llm=llm)
+        # Keep API contract consistent: return via memo_markdown.
+        state = ManagerState(
+            competitor_name=_extract_entity_from_question(competitor_prompt) or "unknown",
+            parsed_prompt=ManagerParsedPrompt(competitor_name="unknown"),
+        )
+        return ManagerResult(state=state, memo_markdown=direct)
+
     parsed = _parse_prompt_with_llm(competitor_prompt, llm) or _parse_prompt_with_regex(
         competitor_prompt
     )
@@ -177,11 +340,14 @@ def run_manager_workflow(*, competitor_prompt: str, llm) -> ManagerResult:
     fin_agent = build_financial_analyst_agent(llm)
     writer_agent = build_report_writer_agent(llm)
 
+    logger.info("Invoking agents: NewsResearcher -> FinancialAnalyst -> ReportWriter")
+
     # 1) News research
     news_task = build_news_task(
         news_agent,
         competitor_name=parsed.competitor_name,
         keywords=parsed.keywords,
+        mode="report_research",
     )
 
     crew = Crew(
