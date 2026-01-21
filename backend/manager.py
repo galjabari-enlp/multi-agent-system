@@ -17,6 +17,52 @@ from backend.schemas import ManagerParsedPrompt, ManagerState, NewsResearchResul
 logger = logging.getLogger(__name__)
 
 
+def _parse_prompt_with_llm(prompt: str, llm) -> Optional[ManagerParsedPrompt]:
+    """Use the LLM to extract a structured ManagerParsedPrompt from free-form text.
+
+    We still validate with Pydantic and fall back to deterministic regex parsing if it fails.
+    """
+
+    # We avoid Crew/Agent here intentionally to keep parsing fast and deterministic.
+    instruction = (
+        "Extract structured fields from the user prompt for a competitor research report. "
+        "Return ONLY valid JSON that matches the schema exactly. "
+        "If a field is unknown, use null (for optional strings) or [] for keywords. "
+        "Do not wrap in markdown/backticks. Do not include extra keys."
+    )
+
+    schema = ManagerParsedPrompt.model_json_schema()
+
+    messages = [
+        {"role": "system", "content": instruction},
+        {
+            "role": "user",
+            "content": (
+                "USER PROMPT:\n"
+                + prompt
+                + "\n\nJSON SCHEMA:\n"
+                + json.dumps(schema)
+            ),
+        },
+    ]
+
+    try:
+        # CrewAI LLM exposes a call interface; we keep this best-effort and tolerant.
+        raw = llm.call(messages)  # type: ignore[attr-defined]
+    except Exception:
+        logger.exception("LLM prompt parsing failed")
+        return None
+
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+
+    try:
+        return ManagerParsedPrompt.model_validate_json(raw)
+    except Exception:
+        logger.warning("LLM output did not validate as ManagerParsedPrompt. raw=%r", raw)
+        return None
+
+
 @dataclass
 class ManagerResult:
     state: ManagerState
@@ -38,7 +84,7 @@ def build_manager_agent(llm) -> Agent:
 
 
 def _parse_prompt_with_regex(prompt: str) -> ManagerParsedPrompt:
-    # Minimal deterministic parsing; LLM is used for synthesis, not extraction.
+    # Minimal deterministic parsing; LLM parsing is preferred, regex is fallback.
     competitor = None
     ticker = None
 
@@ -51,18 +97,27 @@ def _parse_prompt_with_regex(prompt: str) -> ManagerParsedPrompt:
         ticker = m2.group(1).strip().upper()
 
     if not competitor:
-        # fallback: first capitalized token chunk
+        # fallback: first line chunk
         competitor = prompt.strip().split("\n")[0][:80].strip()
 
     # Keywords: drop stopwords-ish, keep nouns-ish tokens
     tokens = re.findall(r"[A-Za-z][A-Za-z0-9\-\+]{2,}", prompt)
     stop = {
+        "find",
+        "latest",
+        "news",
+        "press",
+        "releases",
+        "product",
+        "products",
+        "launch",
+        "launches",
+        "for",
+        "about",
         "research",
         "competitor",
         "focus",
         "recent",
-        "product",
-        "products",
         "pricing",
         "and",
         "any",
@@ -110,7 +165,9 @@ def _needs_second_search(nr: NewsResearchResult) -> bool:
 
 
 def run_manager_workflow(*, competitor_prompt: str, llm) -> ManagerResult:
-    parsed = _parse_prompt_with_regex(competitor_prompt)
+    parsed = _parse_prompt_with_llm(competitor_prompt, llm) or _parse_prompt_with_regex(
+        competitor_prompt
+    )
     logger.info("Parsed prompt: %s", parsed.model_dump())
 
     state = ManagerState(competitor_name=parsed.competitor_name, parsed_prompt=parsed)

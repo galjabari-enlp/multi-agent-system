@@ -82,6 +82,14 @@ def _build_llm() -> LLM:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Ensure UTF-8 output on Windows terminals (avoids UnicodeEncodeError when models
+    # emit typographic characters like , en-dash, etc.).
+    try:  # pragma: no cover
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
     # Loads a local .env file if present (safe no-op in production environments).
     load_dotenv(override=False)
 
