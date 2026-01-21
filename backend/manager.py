@@ -168,57 +168,108 @@ IntentType = Literal["quick_answer", "full_report"]
 
 DomainType = Literal["in_domain", "out_of_domain"]
 
-_DOMAIN_KEYWORDS = [
-    "company",
-    "competitor",
-    "ceo",
-    "founder",
-    "ticker",
-    "stock",
-    "earnings",
-    "revenue",
-    "funding",
-    "valuation",
-    "market cap",
-    "pricing",
-    "product",
-    "partnership",
-    "acquisition",
-    "headquarters",
-    "employees",
-    "net worth",
-    "investor",
-    "financial",
-    "swot",
+DomainCategory = Literal[
+    "company_research",
+    "financial_metric",
+    "stock_market",
+    "executive_lookup",
+    "business_question",
+    "life_advice",
+    "recipe",
+    "health",
+    "other",
 ]
 
 
-def detect_domain(user_message: str) -> tuple[DomainType, list[str]]:
-    """Return (domain, matched_keywords).
+def classify_domain(user_message: str, llm) -> dict:
+    """LLM-based domain gate.
 
-    Heuristic-only domain gate to prevent non-business use. We intentionally
-    avoid LLM calls or tools here.
+    Must decide in/out-of-domain *before* any tools/agents are called.
+
+    Returns a dict matching the JSON schema:
+    {"domain": "in_domain|out_of_domain", "category": "...", "reason": "..."}
+
+    If ambiguous or the model output is invalid, defaults to OUT-OF-DOMAIN.
+
+    Testability note:
+    - If `llm` is falsy/None, we skip classification and default to in-domain.
+      This is only to keep unit tests (which stub out LLM calls) focused on
+      intent routing/tool orchestration rather than networked classification.
     """
 
-    msg = (user_message or "").strip().lower()
-    matched: list[str] = []
-    for kw in _DOMAIN_KEYWORDS:
-        if kw in msg:
-            matched.append(kw)
+    if not llm:
+        return {"domain": "in_domain", "category": "business_question", "reason": "llm_missing"}
 
-    if matched:
-        return "in_domain", matched
+    system_msg = (
+        "You are a domain classifier for a business/finance/company research assistant. "
+        "Decide if the user’s request should be handled by this app. "
+        "Only return valid JSON."
+    )
 
-    # Extra heuristic: proper-noun-like token sequences + business context words.
-    # Example: "Tell me about Tesla" (no explicit keywords) should still be in-domain
-    # if it also contains a business-context signal.
-    business_context = ["company", "business", "startup", "firm", "inc", "ltd", "llc", "plc", "corp"]
-    has_business_context = any(t in msg for t in business_context)
-    has_entity_like = bool(re.search(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\b", user_message or ""))
-    if has_business_context and has_entity_like:
-        return "in_domain", ["entity+business_context"]
+    user_template = (
+        "RAW USER MESSAGE:\n"
+        f"{user_message}\n\n"
+        "RULES:\n"
+        "- IN-DOMAIN if the user asks about a specific company/person in a business/finance context "
+        "(e.g., CEO of Tesla, Elon Musk net worth, Apple ticker, market cap).\n"
+        "- OUT-OF-DOMAIN if it’s generic life advice, career coaching, or generic how-to "
+        "(e.g., ‘how do I become a CEO’ or ‘how do I become CEO of Tesla’).\n"
+        "- OUT-OF-DOMAIN if it’s recipes, relationships, medical/legal, general trivia, etc.\n"
+        "- OUT-OF-DOMAIN even if it mentions a specific company/person, when the *primary ask* is advice on becoming/getting a role "
+        "(becoming CEO, getting hired at X, interview prep, career path).\n"
+        "- If ambiguous, default to OUT-OF-DOMAIN.\n\n"
+        "Return JSON schema:\n"
+        '{ "domain": "in_domain|out_of_domain", "category": "...", "reason": "..." }'
+    )
 
-    return "out_of_domain", []
+    messages = [
+        {"role": "system", "content": system_msg},
+        {"role": "user", "content": user_template},
+    ]
+
+    raw: Optional[str] = None
+    try:
+        raw = llm.call(messages)  # type: ignore[attr-defined]
+    except Exception:
+        # Fail-OPEN so we don't break existing in-domain functionality if the
+        # classifier endpoint is temporarily unavailable.
+        logger.exception("Domain classification LLM call failed; defaulting to in_domain")
+        return {"domain": "in_domain", "category": "business_question", "reason": "llm_call_failed"}
+
+    if not isinstance(raw, str) or not raw.strip():
+        return {"domain": "out_of_domain", "category": "other", "reason": "empty_llm_output"}
+
+    try:
+        data = json.loads(raw)
+    except Exception:
+        logger.warning("Domain classification output was not valid JSON. raw=%r", raw)
+        return {"domain": "out_of_domain", "category": "other", "reason": "invalid_json"}
+
+    domain = data.get("domain")
+    category = data.get("category")
+    reason = data.get("reason")
+
+    allowed_domains = {"in_domain", "out_of_domain"}
+    allowed_categories = {
+        "company_research",
+        "financial_metric",
+        "stock_market",
+        "executive_lookup",
+        "business_question",
+        "life_advice",
+        "recipe",
+        "health",
+        "other",
+    }
+
+    if domain not in allowed_domains:
+        domain = "out_of_domain"
+    if category not in allowed_categories:
+        category = "other"
+    if not isinstance(reason, str) or not reason.strip():
+        reason = "unspecified"
+
+    return {"domain": domain, "category": category, "reason": reason}
 
 
 _QUICK_ANSWER_PATTERNS = [
@@ -395,12 +446,14 @@ def _run_quick_answer(*, user_message: str, llm) -> str:
 
 
 def run_manager_workflow(*, competitor_prompt: str, llm) -> ManagerResult:
-    domain, matched = detect_domain(competitor_prompt)
-    logger.info("Domain gate: domain=%s matched=%s", domain, matched)
+    classification = classify_domain(competitor_prompt, llm)
+    logger.info("Domain gate (LLM): %s", classification)
 
-    if domain == "out_of_domain":
+    if classification.get("domain") == "out_of_domain":
         # Strict gate: do not call any agents/tools for out-of-domain messages.
-        fixed = "I can only help with company, business, and finance questions—please try another question."
+        fixed = (
+            "I can only help with company, business, finance, and stock-related questions—please try another question."
+        )
         state = ManagerState(
             competitor_name="unknown",
             parsed_prompt=ManagerParsedPrompt(competitor_name="unknown"),
