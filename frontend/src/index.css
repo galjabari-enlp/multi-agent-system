@@ -1,0 +1,55 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: #0b0e11;
+  color: #e6e9ee;
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial,
+    Apple Color Emoji, Segoe UI Emoji;
+  line-height: 1.45;
+}
+
+* {
+  scrollbar-color: #2b3642 transparent;
+}
+
+:focus-visible {
+  outline: 2px solid #d71920;
+  outline-offset: 2px;
+}
+
+.prose {
+  --tw-prose-body: theme(colors.text);
+  --tw-prose-headings: theme(colors.text);
+  --tw-prose-links: theme(colors.accent);
+  --tw-prose-bold: theme(colors.text);
+  --tw-prose-bullets: theme(colors.muted);
+  --tw-prose-hr: theme(colors.border);
+  --tw-prose-quotes: theme(colors.text);
+  --tw-prose-quote-borders: theme(colors.border);
+  --tw-prose-code: theme(colors.text);
+  --tw-prose-pre-bg: theme(colors.codeBg);
+  max-width: none;
+}
+
+.prose code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, Liberation Mono,
+    Courier New, monospace;
+  font-size: 12px;
+}
+
+.prose pre {
+  border: 1px solid #1f2a35;
+  border-radius: 10px;
+}

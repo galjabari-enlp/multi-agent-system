@@ -25,10 +25,15 @@ def build_news_researcher_agent(llm) -> Agent:
 
 def _serper_tool(company_name: str, keywords: List[str]) -> List[Source]:
     # Multiple focused queries yields better coverage; Manager can trigger a second pass if needed.
+    # Include dedicated queries for HQ + leadership + headcount to reduce "unknown" fields.
     queries = [
-        f"{company_name} company overview headquarters CEO founded employees",
+        f"{company_name} headquarters location corporate HQ",
+        f"{company_name} CEO leadership executives founders",
+        f"{company_name} employee count headcount employees",
+        f"{company_name} company overview founded",
         f"{company_name} product launch pricing plans",
         f"{company_name} partnership acquisition layoff reorg press release",
+        f"{company_name} press release newsroom",
         f"{company_name} news 2024 2025",
     ]
     if keywords:
@@ -65,6 +70,7 @@ Return ONLY valid JSON that matches this schema:
 Rules:
 - Return JSON ONLY (no markdown, no backticks, no trailing commentary).
 - Prefer last 6-12 months for Recent Developments.
+- For company overview fields (HQ, founded, employees, executives): prefer official pages (about, investor relations) and reputable sources.
 - If data is missing, put 'unknown' (string) or [] for lists.
 - Use ONLY double quotes in JSON.
 

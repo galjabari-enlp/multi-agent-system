@@ -41,6 +41,9 @@ class AlphaVantageClient:
                     # Rate limits / errors are returned in JSON with 200.
                     msg = data.get("Information") or data.get("Note") or data.get("Error Message")
                     if msg:
+                        # Don't retry for daily-limit messages; it will never succeed.
+                        if "per day" in str(msg).lower():
+                            raise AlphaVantageError(str(msg))
                         time.sleep(1.2 * (attempt + 1))
                         raise AlphaVantageError(str(msg))
 
@@ -61,6 +64,9 @@ class AlphaVantageClient:
 
     def income_statement(self, symbol: str) -> Dict[str, Any]:
         return self._get({"function": "INCOME_STATEMENT", "symbol": symbol})
+
+    def cash_flow(self, symbol: str) -> Dict[str, Any]:
+        return self._get({"function": "CASH_FLOW", "symbol": symbol})
 
     def earnings(self, symbol: str) -> Dict[str, Any]:
         return self._get({"function": "EARNINGS", "symbol": symbol})
@@ -142,3 +148,27 @@ def summarize_revenue_growth(income_statement: Dict[str, Any]) -> Tuple[str, str
     g = _pct(r0, r1)
     growth = f"{g:.1f}% YoY" if g is not None else "unknown"
     return revenue, growth
+
+
+def summarize_free_cash_flow(cash_flow: Dict[str, Any]) -> str:
+    """Best-effort free cash flow summary.
+
+    Alpha Vantage `CASH_FLOW` provides `annualReports` and `quarterlyReports`.
+    We use the latest annual `operatingCashflow` and `capitalExpenditures` to
+    compute a simple FCF proxy: OCF - CapEx.
+
+    Returns a human-readable string, or "unknown".
+    """
+
+    annual = cash_flow.get("annualReports") or []
+    if not isinstance(annual, list) or not annual:
+        return "unknown"
+
+    latest = annual[0] or {}
+    ocf = _safe_float(latest.get("operatingCashflow"))
+    capex = _safe_float(latest.get("capitalExpenditures"))
+    if ocf is None or capex is None:
+        return "unknown"
+
+    fcf = ocf - capex
+    return f"FCF (annual): {_fmt_money(fcf)}"

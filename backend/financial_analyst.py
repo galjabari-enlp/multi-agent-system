@@ -8,6 +8,7 @@ from crewai import Agent, Task
 from backend.schemas import FinancialAnalysisResult, FinancialOverview, PricePerformance, Source
 from backend.tools.alpha_vantage import (
     AlphaVantageClient,
+    summarize_free_cash_flow,
     summarize_price_performance,
     summarize_revenue_growth,
 )
@@ -83,7 +84,24 @@ def _fetch_financials(
 ) -> FinancialAnalysisResult:
     client = AlphaVantageClient.from_env()
 
-    resolved = ticker or _resolve_ticker(client, competitor_name)
+    try:
+        resolved = ticker or _resolve_ticker(client, competitor_name)
+    except Exception as e:  # noqa: BLE001
+        fo = FinancialOverview(
+            ticker=ticker or "unknown",
+            market_cap="unknown",
+            revenue="unknown",
+            revenue_growth="unknown",
+            profitability="unknown",
+            burn_rate="unknown",
+            funding_and_valuation="unknown",
+            notes=[
+                "Alpha Vantage SYMBOL_SEARCH failed (likely daily rate limit).",
+                f"error: {e}",
+            ],
+        )
+        return FinancialAnalysisResult(financial_overview=fo, sources=[])
+
     if not resolved:
         fo = FinancialOverview(
             ticker="unknown",
@@ -99,8 +117,24 @@ def _fetch_financials(
         )
         return FinancialAnalysisResult(financial_overview=fo, sources=[])
 
-    overview = client.overview(resolved)
-    income = client.income_statement(resolved)
+    try:
+        overview = client.overview(resolved)
+        income = client.income_statement(resolved)
+    except Exception as e:  # noqa: BLE001
+        fo = FinancialOverview(
+            ticker=resolved,
+            market_cap="unknown",
+            revenue="unknown",
+            revenue_growth="unknown",
+            profitability="unknown",
+            burn_rate="unknown",
+            funding_and_valuation="unknown",
+            notes=[
+                "Alpha Vantage request failed (likely rate limit).",
+                f"error: {e}",
+            ],
+        )
+        return FinancialAnalysisResult(financial_overview=fo, sources=[])
 
     market_cap = overview.get("MarketCapitalization")
     revenue_ttm = overview.get("RevenueTTM") or overview.get("RevenuePerShareTTM")
@@ -117,7 +151,9 @@ def _fetch_financials(
     op_margin = overview.get("OperatingMarginTTM")
     profitability = "unknown"
     if profit_margin or op_margin:
-        profitability = f"profit margin: {profit_margin or 'unknown'}; operating margin: {op_margin or 'unknown'}"
+        profitability = (
+            f"profit margin: {profit_margin or 'unknown'}; operating margin: {op_margin or 'unknown'}"
+        )
 
     # Market cap formatting best-effort
     mcap_str = "unknown"
@@ -126,6 +162,16 @@ def _fetch_financials(
             mcap_str = f"${float(market_cap)/1e9:.2f}B"
     except Exception:  # noqa: BLE001
         mcap_str = str(market_cap)
+
+    # Burn / FCF proxy (via CASH_FLOW)
+    burn_rate = "unknown"
+    try:
+        cf = client.cash_flow(resolved)
+        burn_rate = summarize_free_cash_flow(cf)
+    except Exception as e:  # noqa: BLE001
+        burn_rate = "unknown"
+        # Debuggable but non-fatal.
+        print(f"[warn] cash_flow fetch failed for {resolved}: {e}")
 
     # Price performance
     perf_obj: Optional[PricePerformance] = None
@@ -140,8 +186,11 @@ def _fetch_financials(
                 change_1m_pct=None if p1m is None else round(p1m, 2),
                 change_6m_pct=None if p6m is None else round(p6m, 2),
             )
-    except Exception:  # noqa: BLE001
+        else:
+            print(f"[warn] price_performance missing for {resolved}: empty time series")
+    except Exception as e:  # noqa: BLE001
         perf_obj = None
+        print(f"[warn] price_performance computation failed for {resolved}: {e}")
 
     fo = FinancialOverview(
         ticker=resolved,
@@ -149,7 +198,7 @@ def _fetch_financials(
         revenue=revenue,
         revenue_growth=growth,
         profitability=profitability,
-        burn_rate="unknown",
+        burn_rate=burn_rate,
         funding_and_valuation=(
             f"public markets (market cap {mcap_str})" if mcap_str != "unknown" else "unknown"
         ),
